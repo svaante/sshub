@@ -1,0 +1,67 @@
+#+title: sshub
+
+Use USB devices plugged into one Linux machine (the server) on another (the
+client), over SSH. Devices show up on the client as if plugged in locally
+(=lsusb=, =/dev/ttyACM0=, ...), using the kernel's USB/IP.
+
+* Install
+
+On each machine, with Go 1.26 or later:
+
+#+begin_src sh
+git clone https://github.com/svaante/sshub
+cd sshub
+go build -o . ./cmd/...
+sudo scripts/install.sh server
+sudo scripts/install.sh client    # needs usbip (linux-tools-generic)
+#+end_src
+
+* Share devices
+
+On the server, list them in =/etc/sshub/devices=, one =vid:pid= per line,
+optionally followed by a serial number to pick one device (see =lsusb=):
+
+#+begin_src sh
+sudoedit /etc/sshub/devices
+#+end_src
+
+For example:
+
+#+begin_example
+# CH340 USB-serial adapter
+1a86:7523
+
+# J-Link, only this one
+1366:0105    01:23:45:67:89:AB
+#+end_example
+
+* Use
+
+On the client:
+
+#+begin_src sh
+sshub <server>
+#+end_src
+
+This attaches every shared device and keeps them attached: devices plugged in
+later, or reset, are attached (again) automatically. Ctrl-C detaches all.
+
+* Restricted access
+
+To give someone the devices but no shell on the server, make them an account
+in the =sshub= group whose key can only run =sshub-server=, in a root-owned
+=authorized_keys= (so the account cannot change it):
+
+#+begin_example
+restrict,command="/usr/local/bin/sshub-server" ssh-ed25519 AAAA... them
+#+end_example
+
+* Uninstall
+
+On either machine:
+
+#+begin_src sh
+sudo /usr/libexec/sshub/install.sh uninstall
+#+end_src
+
+This keeps =/etc/sshub=.

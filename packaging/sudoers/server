@@ -1,0 +1,15 @@
+# sudoers drop-in for an sshub server. Install as /etc/sudoers.d/sshub,
+# owned by root, mode 0440.
+#
+# Lets the sshub group run the root helper: users who run sshub-server over
+# their ssh login. The helper checks its own arguments and re-reads
+# /etc/sshub/devices, so the rule names it without arguments; sudo-rs rejects
+# wildcard arguments anyway.
+Cmnd_Alias SSHUB_HELPER = /usr/libexec/sshub/sshub-helper
+
+# export receives the connected socket as stdin: keep sudo from putting a pty
+# or pipe in between. With classic sudo and I/O logging turned on, also add
+# !log_input and !log_output; sudo-rs has no I/O logging and rejects them.
+Defaults!SSHUB_HELPER !use_pty
+
+%sshub ALL=(root) NOPASSWD: SSHUB_HELPER

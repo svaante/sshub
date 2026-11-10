@@ -1,0 +1,205 @@
+#!/bin/bash -p
+# sshub-helper: the few sshub actions that need root, run via sudo.
+#
+# On the server, by sshub-server:
+#   sshub-helper export <busid>            (stdin: the connected stream socket)
+#   sshub-helper release <busid>
+# On the client, by sshub, as a front end to usbip:
+#   sshub-helper attach <tcp-port> <busid>
+#   sshub-helper detach <vhci-port>
+#   sshub-helper port
+#
+# Every argument comes from an unprivileged caller and is checked here. export
+# re-reads /etc/sshub/devices itself: the caller is not trusted to have
+# checked it. The sysfs sequences mirror the kernel's usbip bind/unbind tools
+# (tools/usb/usbip/src/usbip_bind.c, usbip_unbind.c).
+set -eu
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+IFS=$' \t\n'
+
+# Where things live. Tests run a copy with these four lines changed.
+SYS=/sys
+CONF=/etc/sshub
+USBIP=/usr/bin/usbip
+ROOT_UID=0
+
+# The devices file format; internal/share uses the same expressions.
+skip_re='^[[:blank:]]*(#.*)?$'
+device_re='^([0-9a-f]{4}):([0-9a-f]{4})([[:blank:]]+([^[:blank:]]+))?[[:blank:]]*$'
+# A USB device in sysfs: bus number, then the port chain ("3-1", "1-2.4.1").
+busid_re='^[1-9][0-9]{0,2}-[1-9][0-9]{0,2}(\.[1-9][0-9]{0,2}){0,6}$'
+number_re='^(0|[1-9][0-9]{0,4})$'
+
+host=$SYS/bus/usb/drivers/usbip-host
+
+die() {
+	printf 'sshub-helper: %s\n' "$*" >&2
+	exit 1
+}
+
+usage() {
+	printf '%s\n' \
+		'usage: sshub-helper export|release <busid>' \
+		'       sshub-helper attach <tcp-port> <busid>' \
+		'       sshub-helper detach <vhci-port>' \
+		'       sshub-helper port' >&2
+	exit 2
+}
+
+valid_busid() {
+	[[ $1 =~ $busid_re ]]
+}
+
+# valid_number N: N is a decimal number up to 65535 in canonical form (no
+# sign, no leading zeros), so usbip gets exactly the number checked.
+valid_number() {
+	[[ $1 =~ $number_re ]] && (($1 <= 65535))
+}
+
+# attr FILE: the value of a sysfs attribute, or nothing if it is absent.
+attr() {
+	local v=
+	if [[ -e $1 ]]; then
+		read -r v <"$1" || :
+	fi
+	printf '%s' "$v"
+}
+
+# write FILE VALUE: store VALUE in a sysfs attribute with a single write.
+# Never creates FILE, so a wrong path fails instead of leaving a regular file.
+write() {
+	[[ -f $1 ]] || return 1
+	printf '%s' "$2" >"$1"
+}
+
+# trusted PATH: refuse anything someone other than root could have written.
+trusted() {
+	local perm uid
+	read -r perm _ uid _ < <(ls -ldnL -- "$1") || die "$1: cannot stat"
+	[[ $uid == "$ROOT_UID" ]] || die "$1: must be owned by root"
+	[[ ${perm:5:1} != w && ${perm:8:1} != w ]] || die "$1: must not be group or world writable"
+}
+
+# shared BUSID: the device on BUSID matches a line in the devices file. The
+# whole file is read first: one invalid line rejects it, as it does for
+# sshub-server. A missing file shares nothing.
+shared() {
+	local dev=$SYS/bus/usb/devices/$1 line n=0 found= vid pid serial want_serial
+	trusted "$CONF"
+	[[ -e $CONF/devices ]] || return 1
+	trusted "$CONF/devices"
+	vid=$(attr "$dev/idVendor")
+	pid=$(attr "$dev/idProduct")
+	serial=$(attr "$dev/serial")
+	while IFS= read -r line || [[ -n $line ]]; do
+		n=$((n + 1))
+		if [[ $line =~ $skip_re ]]; then
+			continue
+		fi
+		[[ $line =~ $device_re ]] || die "$CONF/devices:$n: invalid line"
+		want_serial=${BASH_REMATCH[4]-}
+		if [[ ${BASH_REMATCH[1]} == "$vid" && ${BASH_REMATCH[2]} == "$pid" ]] &&
+			[[ -z $want_serial || $want_serial == "$serial" ]]; then
+			found=1
+		fi
+	done <"$CONF/devices"
+	[[ -n $found ]]
+}
+
+# driver BUSID: the driver bound to the device, or nothing.
+driver() {
+	local link=$SYS/bus/usb/devices/$1/driver
+	if [[ -L $link ]]; then
+		basename -- "$(readlink -- "$link")"
+	fi
+}
+
+# bind BUSID: move the device from its current driver, if any, to usbip-host.
+bind() {
+	local busid=$1 drv
+	drv=$(driver "$busid")
+	if [[ -n $drv ]]; then
+		write "$SYS/bus/usb/drivers/$drv/unbind" "$busid" || die "export $busid: unbind from $drv failed"
+	fi
+	write "$host/match_busid" "add $busid" || die "export $busid: match_busid failed"
+	if ! write "$host/bind" "$busid"; then
+		# Undo, so the device does not stay without a driver. Best effort:
+		# the bind error is the one worth reporting.
+		write "$host/match_busid" "del $busid" || :
+		write "$SYS/bus/usb/drivers_probe" "$busid" || :
+		die "export $busid: bind to usbip-host failed"
+	fi
+}
+
+# export BUSID: bind the device to usbip-host, unless it already is, and hand
+# it our stdin, a connected socket. The kernel takes its own reference to the
+# socket, so sshub-server may close it afterwards.
+cmd_export() {
+	local busid=$1 dev status
+	valid_busid "$busid" || die "export: invalid busid '$busid'"
+	dev=$SYS/bus/usb/devices/$busid
+	[[ -d $dev ]] || die "export $busid: no such device"
+	# Like the stock usbip bind: exporting a hub would take every device
+	# behind it away from the server.
+	[[ $(attr "$dev/bDeviceClass") != 09 ]] || die "export $busid: device is a hub"
+	shared "$busid" || die "export $busid: device is not shared"
+	# The socket arrives as stdin, so no fd number is taken from the command
+	# line. usbip-host itself checks that it is a stream socket.
+	[[ -S /dev/stdin ]] || die "export $busid: stdin is not a socket"
+	status=$(attr "$dev/usbip_status")
+	case $status in
+	'') bind "$busid" ;;
+	1) ;; # left bound by an earlier session; reuse it
+	2) die "export $busid: device is in use" ;;
+	*) die "export $busid: device is in state '$status'" ;;
+	esac
+	# The kernel looks the number up in the writing process: this shell,
+	# whose fd 0 is the socket.
+	write "$host/$busid/usbip_sockfd" 0 || die "export $busid: handing over the socket failed"
+}
+
+# release BUSID: unbind the device from usbip-host and let the kernel probe
+# its regular driver again. Does not consult the devices file: it can only
+# give a device back to the server, and must still work after its share was
+# removed.
+cmd_release() {
+	local busid=$1
+	valid_busid "$busid" || die "release: invalid busid '$busid'"
+	# A device that is gone (unplugged, or reset while exported) has nothing
+	# to unbind, and the same holds for one not bound to usbip-host. Only the
+	# match_busid entry may be left; without it, usbip-host would grab the
+	# device when it comes back.
+	if [[ ! -d $SYS/bus/usb/devices/$busid || $(driver "$busid") != usbip-host ]]; then
+		# Not having an entry is the normal case, so failure is ignored.
+		write "$host/match_busid" "del $busid" || :
+		return 0
+	fi
+	write "$host/unbind" "$busid" || die "release $busid: unbind failed"
+	write "$host/match_busid" "del $busid" || die "release $busid: match_busid failed"
+	write "$SYS/bus/usb/drivers_probe" "$busid" || die "release $busid: reprobe failed"
+}
+
+# The client actions run usbip with an empty environment: it needs none, and
+# ours comes from the unprivileged caller.
+
+# attach TCP-PORT BUSID: attach busid through the client's bridge. The host
+# is fixed: the helper must not attach devices from anywhere the caller likes.
+cmd_attach() {
+	valid_number "$1" && [[ $1 != 0 ]] || die "attach: invalid tcp port '$1'"
+	valid_busid "$2" || die "attach: invalid busid '$2'"
+	exec env -i "$USBIP" --tcp-port "$1" attach -r 127.0.0.1 -b "$2"
+}
+
+cmd_detach() {
+	valid_number "$1" || die "detach: invalid port '$1'"
+	exec env -i "$USBIP" detach -p "$1"
+}
+
+case ${1-}:$# in
+export:2) cmd_export "$2" ;;
+release:2) cmd_release "$2" ;;
+attach:3) cmd_attach "$2" "$3" ;;
+detach:2) cmd_detach "$2" ;;
+port:1) exec env -i "$USBIP" port ;;
+*) usage ;;
+esac

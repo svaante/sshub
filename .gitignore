@@ -1,0 +1,7 @@
+# Local test VM (see TODO.md step 0)
+*.iso
+*.qcow2
+
+# Built by go build -o . ./cmd/...
+/sshub
+/sshub-server

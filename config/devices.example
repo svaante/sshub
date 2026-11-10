@@ -1,0 +1,9 @@
+# /etc/sshub/devices: shared devices, one per line, as vid:pid [serial].
+# Without a serial, every device with that vid:pid is shared. Comments go on
+# their own line.
+
+# CH340 USB-serial adapter
+1a86:7523
+
+# J-Link, only this one
+1366:0105    01:23:45:67:89:AB
