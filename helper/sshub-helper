@@ -4,15 +4,16 @@
 # On the server, by sshub-server:
 #   sshub-helper export <busid>            (stdin: the connected stream socket)
 #   sshub-helper release <busid>
-# On the client, by sshub, as a front end to usbip:
-#   sshub-helper attach <tcp-port> <busid>
+# On the client, by sshub:
+#   sshub-helper attach <speed> <busnum> <devnum>   (stdin: the connected stream socket)
 #   sshub-helper detach <vhci-port>
-#   sshub-helper port
+# On the client, by the udev rule:
+#   sshub-helper owner <devpath>
 #
 # Every argument comes from an unprivileged caller and is checked here. export
 # re-reads /etc/sshub/devices itself: the caller is not trusted to have
-# checked it. The sysfs sequences mirror the kernel's usbip bind/unbind tools
-# (tools/usb/usbip/src/usbip_bind.c, usbip_unbind.c).
+# checked it. The sysfs sequences mirror the kernel's usbip tools
+# (tools/usb/usbip/src/usbip_bind.c, usbip_unbind.c, libsrc/vhci_driver.c).
 set -eu
 export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
 IFS=$' \t\n'
@@ -20,7 +21,7 @@ IFS=$' \t\n'
 # Where things live. Tests run a copy with these four lines changed.
 SYS=/sys
 CONF=/etc/sshub
-USBIP=/usr/bin/usbip
+RUN=/run/sshub
 ROOT_UID=0
 
 # The devices file format; internal/share uses the same expressions.
@@ -31,6 +32,8 @@ busid_re='^[1-9][0-9]{0,2}-[1-9][0-9]{0,2}(\.[1-9][0-9]{0,2}){0,6}$'
 number_re='^(0|[1-9][0-9]{0,4})$'
 
 host=$SYS/bus/usb/drivers/usbip-host
+# vhci_hcd.0 carries the sysfs files of every vhci controller.
+vhci=$SYS/devices/platform/vhci_hcd.0
 
 die() {
 	printf 'sshub-helper: %s\n' "$*" >&2
@@ -40,9 +43,9 @@ die() {
 usage() {
 	printf '%s\n' \
 		'usage: sshub-helper export|release <busid>' \
-		'       sshub-helper attach <tcp-port> <busid>' \
+		'       sshub-helper attach <speed> <busnum> <devnum>' \
 		'       sshub-helper detach <vhci-port>' \
-		'       sshub-helper port' >&2
+		'       sshub-helper owner <devpath>' >&2
 	exit 2
 }
 
@@ -51,7 +54,7 @@ valid_busid() {
 }
 
 # valid_number N: N is a decimal number up to 65535 in canonical form (no
-# sign, no leading zeros), so usbip gets exactly the number checked.
+# sign, no leading zeros), so the kernel gets exactly the number checked.
 valid_number() {
 	[[ $1 =~ $number_re ]] && (($1 <= 65535))
 }
@@ -179,27 +182,130 @@ cmd_release() {
 	write "$SYS/bus/usb/drivers_probe" "$busid" || die "release $busid: reprobe failed"
 }
 
-# The client actions run usbip with an empty environment: it needs none, and
-# ours comes from the unprivileged caller.
+# The client actions attach and detach through vhci's sysfs files, as the
+# usbip tool does, but take the socket from stdin like export: there is no
+# TCP connection for another local user to reach. Each port sshub attaches
+# gets a record, $RUN/port<N>, holding "<uid> <devid>": who attached it, and
+# what. detach and the udev rule (owner) go by it. A record whose port is
+# free, or holds another device, means nothing; attach overwrites it.
 
-# attach TCP-PORT BUSID: attach busid through the client's bridge. The host
-# is fixed: the helper must not attach devices from anywhere the caller likes.
-cmd_attach() {
-	valid_number "$1" && [[ $1 != 0 ]] || die "attach: invalid tcp port '$1'"
-	valid_busid "$2" || die "attach: invalid busid '$2'"
-	exec env -i "$USBIP" --tcp-port "$1" attach -r 127.0.0.1 -b "$2"
+# caller: the uid of who ran us. sudo sets SUDO_UID itself, whatever the
+# caller's environment says. Run as root without sudo, it is root.
+caller() {
+	if [[ -z ${SUDO_UID-} ]]; then
+		printf '%s' "$ROOT_UID"
+		return
+	fi
+	[[ $SUDO_UID =~ ^(0|[1-9][0-9]{0,9})$ ]] || die "invalid SUDO_UID"
+	printf '%s' "$SUDO_UID"
 }
 
+# ports: one line per vhci port, from the status files: hub (hs or ss), port
+# number, state (004 free, 005 attaching, 006 in use, 007 error), devid in
+# hex, and the local busid of the device on it (0-0 until it is in use).
+ports() {
+	local f hub port sta _spd dev _sockfd busid
+	for f in "$vhci"/status "$vhci"/status.*; do
+		[[ -f $f ]] || continue
+		while read -r hub port sta _spd dev _sockfd busid; do
+			[[ $hub == hs || $hub == ss ]] || continue
+			[[ $port =~ ^[0-9]{1,5}$ ]] || die "$f: invalid port '$port'"
+			printf '%s %d %s %s %s\n' "$hub" "$((10#$port))" "$sta" "$dev" "$busid"
+		done <"$f"
+	done
+}
+
+# record_owner PORT DEV: the uid in PORT's record if it is for DEV, the
+# devid in hex as the status files show it. Nothing otherwise.
+record_owner() {
+	local uid devid
+	read -r uid devid 2>/dev/null <"$RUN/port$1" || return 0
+	[[ $uid =~ ^[0-9]{1,10}$ && $devid =~ ^[0-9]{1,10}$ ]] || return 0
+	if [[ $(printf '%08x' "$devid") == "$2" ]]; then
+		printf '%s' "$uid"
+	fi
+}
+
+# attach SPEED BUSNUM DEVNUM: attach the device sshub-server is serving on
+# our stdin, as described by its import reply, to a free vhci port. Prints
+# the port.
+cmd_attach() {
+	local speed=$1 devid uid hub=hs port sta _ tmp
+	valid_number "$speed" || die "attach: invalid speed '$1'"
+	valid_number "$2" || die "attach: invalid busnum '$2'"
+	valid_number "$3" || die "attach: invalid devnum '$3'"
+	# The kernel looks up fd 0 in this shell, as for export.
+	[[ -S /dev/stdin ]] || die "attach: stdin is not a socket"
+	devid=$(($2 << 16 | $3))
+	uid=$(caller)
+	# SuperSpeed and faster devices go on the ss hub.
+	if ((speed >= 5)); then
+		hub=ss
+	fi
+	mkdir -p -m 0755 -- "$RUN"
+	trusted "$RUN"
+	# Another attach may take the same free port first: then the kernel
+	# says busy, and the next free one is tried. The ports come in on fd 3:
+	# fd 0 must stay the socket.
+	while read -r -u 3 _ port sta _; do
+		[[ $sta == 004 ]] || continue
+		if ! write "$vhci/attach" "$port 0 $devid $speed"; then
+			continue
+		fi
+		# The udev rule needs the record once the device is enumerated,
+		# which takes network round trips after the write above.
+		tmp=$RUN/.port$port.$$
+		printf '%s %s\n' "$uid" "$devid" >"$tmp"
+		mv -f -- "$tmp" "$RUN/port$port"
+		printf '%s\n' "$port"
+		return 0
+	done 3< <(ports | grep "^$hub ")
+	die "attach: no free vhci port took the device"
+}
+
+# detach PORT: detach the device on a vhci port the caller attached. A port
+# that is already free counts as detached: the connection may have dropped.
 cmd_detach() {
-	valid_number "$1" || die "detach: invalid port '$1'"
-	exec env -i "$USBIP" detach -p "$1"
+	local port=$1 uid hub p sta dev _
+	valid_number "$port" || die "detach: invalid port '$port'"
+	uid=$(caller)
+	while read -r hub p sta dev _; do
+		[[ $p == "$port" ]] || continue
+		[[ $sta != 004 ]] || return 0
+		if [[ $uid != "$ROOT_UID" && $(record_owner "$port" "$dev") != "$uid" ]]; then
+			die "detach: port $port is not yours"
+		fi
+		# While the port is ours, no attach can claim it, so the
+		# record goes first.
+		rm -f -- "$RUN/port$port"
+		write "$vhci/detach" "$port" || die "detach $port: failed"
+		return 0
+	done < <(ports)
+	die "detach: no such port $port"
+}
+
+# owner DEVPATH: for the udev rule. If DEVPATH is a device sshub attached,
+# or anything below it (interface, tty, ...), print SSHUB_OWNER=<uid>.
+cmd_owner() {
+	local re='^/devices/platform/vhci_hcd\.[0-9]+/usb[0-9]+/([0-9]+-[0-9]+)(/.*)?$'
+	local busid _ port sta dev local_busid uid
+	[[ $1 =~ $re ]] || return 0
+	busid=${BASH_REMATCH[1]}
+	while read -r _ port sta dev local_busid; do
+		[[ $sta == 006 && $local_busid == "$busid" ]] || continue
+		uid=$(record_owner "$port" "$dev")
+		if [[ -n $uid ]]; then
+			printf 'SSHUB_OWNER=%s\n' "$uid"
+		fi
+		return 0
+	done < <(ports)
 }
 
 case ${1-}:$# in
 export:2) cmd_export "$2" ;;
 release:2) cmd_release "$2" ;;
-attach:3) cmd_attach "$2" "$3" ;;
+attach:4) cmd_attach "$2" "$3" "$4" ;;
 detach:2) cmd_detach "$2" ;;
-port:1) exec env -i "$USBIP" port ;;
+owner:2) cmd_owner "$2" ;;
 *) usage ;;
 esac

@@ -1,7 +1,13 @@
 # sudoers drop-in for a sshub client. Install as /etc/sudoers.d/sshub,
 # owned by root, mode 0440.
 #
-# Lets members of the sshub group attach devices: sshub runs
-# usbip through the root helper, which checks the arguments (the attach host
-# is always 127.0.0.1). No wildcard arguments, which sudo-rs rejects.
-%sshub ALL=(root) NOPASSWD: /usr/libexec/sshub/sshub-helper
+# Lets the sshub group attach devices through the root helper, which checks
+# its own arguments and only detaches ports the caller attached, so the rule
+# names it without arguments; sudo-rs rejects wildcard arguments anyway.
+Cmnd_Alias SSHUB_HELPER = /usr/libexec/sshub/sshub-helper
+
+# attach receives the connected socket as stdin: keep sudo from putting a pty
+# or pipe in between.
+Defaults!SSHUB_HELPER !use_pty
+
+%sshub ALL=(root) NOPASSWD: SSHUB_HELPER

@@ -1,0 +1,18 @@
+# udev rules for a sshub client. Install as /etc/udev/rules.d/72-sshub.rules.
+#
+# Devices attached through vhci (USB/IP), and everything below them (ttys,
+# hidraw, ...), belong to the user who attached them with sshub, mode 0600;
+# sshub-helper owner looks that user up. Any other vhci device is root's.
+# The number puts this after 70-uaccess.rules and before 73-seat-late.rules,
+# so the desktop seat's user gets no ACL on them either. ":=" keeps later
+# rules from widening access again.
+
+ACTION=="remove", GOTO="sshub_end"
+DEVPATH!="/devices/platform/vhci_hcd.*/usb*/*", GOTO="sshub_end"
+
+IMPORT{program}="/usr/libexec/sshub/sshub-helper owner $devpath"
+TAG-="uaccess"
+ENV{SSHUB_OWNER}=="?*", OWNER:="$env{SSHUB_OWNER}"
+OWNER:="root", GROUP:="root", MODE:="0600"
+
+LABEL="sshub_end"

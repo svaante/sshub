@@ -5,8 +5,8 @@
 #   install.sh [-n] server [user]   sshub-server + helper, usbip-host,
 #                                   /etc/sshub, user (default: who ran sudo)
 #                                   in the sshub group
-#   install.sh [-n] client [user]   sshub + helper, vhci-hcd, user in the
-#                                   sshub group
+#   install.sh [-n] client [user]   sshub + helper, vhci-hcd, udev rule,
+#                                   user in the sshub group
 #   install.sh [-n] uninstall       remove everything except /etc/sshub
 #
 #   -n  only show the commands that would change the system; needs no root
@@ -23,6 +23,7 @@ src=$(cd "$(dirname "$0")/.." && pwd)
 bindir=/usr/local/bin
 libexec=/usr/libexec/sshub
 conf=/etc/sshub
+udev_rule=/etc/udev/rules.d/72-sshub.rules
 dry= # set by -n
 
 die() {
@@ -153,16 +154,16 @@ client() {
 	need sshub
 	install_files sshub
 	load_module vhci-hcd
-	if [ ! -x /usr/bin/usbip ]; then
-		note "warning: /usr/bin/usbip not found (Ubuntu: apt install linux-tools-generic)"
-	fi
+	# Attached devices belong to whoever attached them.
+	run install -o root -g root -m 0644 "$src/packaging/udev/72-sshub.rules" "$udev_rule"
+	run udevadm control --reload
 	add_user "$user"
 	install_sudoers "$src/packaging/sudoers/client"
 	done_note "client installed; $user must log in again to be in the sshub group"
 }
 
 uninstall() {
-	run rm -f /etc/sudoers.d/sshub /etc/modules-load.d/sshub.conf \
+	run rm -f /etc/sudoers.d/sshub /etc/modules-load.d/sshub.conf "$udev_rule" \
 		"$bindir/sshub" "$bindir/sshub-server"
 	if getent group sshub >/dev/null; then
 		run groupdel sshub

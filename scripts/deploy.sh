@@ -32,7 +32,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o "$out/" ./cmd/sshub ./cmd/ss
 mkdir -p "$out/helper" "$out/scripts" "$out/packaging"
 cp helper/sshub-helper "$out/helper/"
 cp scripts/install.sh "$out/scripts/"
-cp -R packaging/sudoers "$out/packaging/"
+cp -R packaging/sudoers packaging/udev "$out/packaging/"
 
 # Copy over plain ssh rather than scp, which needs sftp-server on the host.
 # COPYFILE_DISABLE keeps macOS tar from adding ._* metadata files.

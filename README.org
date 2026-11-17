@@ -13,7 +13,7 @@ git clone https://github.com/svaante/sshub
 cd sshub
 go build -o . ./cmd/...
 sudo scripts/install.sh server
-sudo scripts/install.sh client    # needs usbip (linux-tools-generic)
+sudo scripts/install.sh client
 #+end_src
 
 * Share devices
@@ -45,6 +45,9 @@ sshub <server>
 
 This attaches every shared device and keeps them attached: devices plugged in
 later, or reset, are attached (again) automatically. Ctrl-C detaches all.
+
+Attached devices belong to you: their device nodes (=/dev/ttyACM0=, ...) are
+mode 0600 and owned by the =sshub= user.
 
 * Restricted access
 

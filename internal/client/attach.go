@@ -1,24 +1,21 @@
 package client
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/svaante/sshub/internal/export"
 	"github.com/svaante/sshub/internal/usbip"
+	"golang.org/x/sys/unix"
 )
-
-// errNoPort means usbip port does not list the device.
-var errNoPort = errors.New("not attached")
 
 // errLost means an attached device went away: unplugged, reset (which
 // re-enumerates it on the server), or the connection to the remote dropped.
@@ -106,141 +103,134 @@ func label(d usbip.Device) string {
 
 // attachDevice attaches dev and keeps it attached until ctx is done (nil)
 // or the device is lost (errLost).
+//
+// The transport gets one end of a socket pair as stdin and stdout; over the
+// other we import dev, then hand that end to the kernel through
+// sshub-helper. Unlike a TCP endpoint for usbip attach, no other local
+// user can reach it.
 func attachDevice(ctx context.Context, t Transport, dev usbip.Device, log io.Writer) error {
-	b, err := ListenBridge()
+	sock, remote, err := socketPair()
 	if err != nil {
-		return err
+		return fmt.Errorf("attach %s: %w", label(dev), err)
 	}
-	defer b.Close()
-	// The bridge outlives ctx: on Ctrl-C we detach first and let the
-	// transport wind down, so the server releases the device cleanly.
-	bctx, stopBridge := context.WithCancel(context.WithoutCancel(ctx))
-	defer stopBridge()
-	bridged := make(chan struct{}) // closed when the bridge is done
-	var bridgeErr error
+	defer sock.Close()
+	// The transport outlives ctx: on Ctrl-C we detach first and let it
+	// wind down, so the server releases the device cleanly.
+	tctx, stopTransport := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopTransport()
+	cmd := t.Command(tctx)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = remote, remote, os.Stderr
+	// On cancellation ask the transport to exit before killing it.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 5 * time.Second
+	err = cmd.Start()
+	remote.Close()
+	if err != nil {
+		return fmt.Errorf("attach %s: start transport: %w", label(dev), err)
+	}
+	exited := make(chan struct{}) // closed when the transport has exited
+	var transportErr error
 	go func() {
-		bridgeErr = b.Serve(bctx, t)
-		close(bridged)
+		transportErr = cmd.Wait()
+		close(exited)
 	}()
 	// Wait for the transport to exit before returning, however we leave.
 	defer func() {
 		select {
-		case <-bridged:
+		case <-exited:
 		case <-time.After(10 * time.Second):
-			stopBridge()
-			<-bridged
+			stopTransport()
+			<-exited
 		}
 	}()
 
-	tcpPort := strconv.Itoa(b.Port())
-	if _, err := runUsbip(ctx, "attach", tcpPort, dev.BusID); err != nil {
-		stopBridge()
-		return fmt.Errorf("attach %s: %w", label(dev), err)
-	}
-	port, err := waitPort(ctx, b.Port(), dev.BusID)
+	// Until the kernel has the socket, Ctrl-C stops the transport, which
+	// also ends a pending read on sock.
+	stop := context.AfterFunc(ctx, stopTransport)
+	port, err := importAndAttach(ctx, sock, dev.BusID)
+	stop()
+	// The kernel holds its own reference to the socket.
+	sock.Close()
 	if err != nil {
-		// Dropping the connection makes vhci detach the device.
-		stopBridge()
+		stopTransport()
 		return fmt.Errorf("attach %s: %w", label(dev), err)
 	}
 	fmt.Fprintf(log, "attached %s on vhci port %d\n", label(dev), port)
 
 	select {
 	case <-ctx.Done():
-	case <-bridged:
+	case <-exited:
 		// vhci has already dropped the device. Ctrl-C in a terminal also
 		// reaches the transport and may end it just before ctx is
 		// cancelled: that is a detach, not a loss.
 		select {
 		case <-ctx.Done():
 		case <-time.After(500 * time.Millisecond):
-			if bridgeErr != nil {
-				return fmt.Errorf("%w: %w", errLost, bridgeErr)
+			if transportErr != nil {
+				return fmt.Errorf("%w: transport: %w", errLost, transportErr)
 			}
 			return errLost
 		}
 	}
-	if err := detach(context.WithoutCancel(ctx), b.Port(), dev.BusID, port); err != nil {
-		return err
+	// The helper counts a port vhci has already freed as detached.
+	if _, err := runHelper(context.WithoutCancel(ctx), nil, "detach", strconv.Itoa(port)); err != nil {
+		return fmt.Errorf("detach %s: %w", label(dev), err)
 	}
 	fmt.Fprintf(log, "detached %s\n", label(dev))
 	return nil
 }
 
-// detach detaches the vhci port. Ctrl-C in a terminal also reaches the
-// transport, whose exit makes vhci drop the device by itself; that counts
-// as success.
-func detach(ctx context.Context, tcpPort int, busid string, port int) error {
-	_, err := runUsbip(ctx, "detach", strconv.Itoa(port))
-	if err == nil {
-		return nil
+// importAndAttach imports busid from sshub-server over sock, then attaches
+// it to a vhci port, which it returns.
+func importAndAttach(ctx context.Context, sock *os.File, busid string) (int, error) {
+	if err := usbip.WriteImportRequest(sock, busid); err != nil {
+		return 0, err
 	}
-	if _, perr := vhciPort(ctx, tcpPort, busid); errors.Is(perr, errNoPort) {
-		return nil
-	}
-	return fmt.Errorf("detach port %d: %w", port, err)
-}
-
-func vhciPort(ctx context.Context, tcpPort int, busid string) (int, error) {
-	out, err := runUsbip(ctx, "port")
+	d, err := usbip.ReadImportReply(sock)
 	if err != nil {
 		return 0, err
 	}
-	return ParsePort(out, tcpPort, busid)
-}
-
-// waitPort waits for busid to show up in "usbip port". It is only listed
-// once the local USB core has enumerated it, about a second after usbip
-// attach returns; until then "usbip port" may also fail outright.
-func waitPort(ctx context.Context, tcpPort int, busid string) (int, error) {
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		port, err := vhciPort(ctx, tcpPort, busid)
-		if err == nil || time.Now().After(deadline) {
-			return port, err
-		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-		}
+	out, err := runHelper(ctx, sock, "attach",
+		strconv.FormatUint(uint64(d.Speed), 10),
+		strconv.FormatUint(uint64(d.BusNum), 10),
+		strconv.FormatUint(uint64(d.DevNum), 10))
+	if err != nil {
+		return 0, err
 	}
-}
-
-var portLine = regexp.MustCompile(`^Port (\d+):`)
-
-// ParsePort finds, in the output of "usbip port", the vhci port on which
-// busid was attached through 127.0.0.1:tcpPort.
-func ParsePort(out []byte, tcpPort int, busid string) (int, error) {
-	want := fmt.Sprintf("-> usbip://127.0.0.1:%d/%s", tcpPort, busid)
-	port := -1
-	sc := bufio.NewScanner(bytes.NewReader(out))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if m := portLine.FindStringSubmatch(line); m != nil {
-			port, _ = strconv.Atoi(m[1])
-			continue
-		}
-		if port >= 0 && strings.HasSuffix(line, want) {
-			return port, nil
-		}
+	port, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("sshub-helper attach: unexpected output %q", out)
 	}
-	return 0, fmt.Errorf("usbip port: %s via port %d: %w", busid, tcpPort, errNoPort)
+	return port, nil
 }
 
-// runUsbip runs the usbip tool as root, through sshub-helper: sudo-rs
-// rejects wildcard arguments in sudoers, so the rule names only the helper,
-// which checks the arguments itself. -n: fail instead of prompting.
-func runUsbip(ctx context.Context, args ...string) ([]byte, error) {
+// socketPair returns a connected pair of stream sockets, both close-on-exec;
+// exec.Cmd clears the flag on the ends it passes on.
+func socketPair() (*os.File, *os.File, error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("socketpair: %w", err)
+	}
+	unix.CloseOnExec(fds[0])
+	unix.CloseOnExec(fds[1])
+	return os.NewFile(uintptr(fds[0]), "usbip"), os.NewFile(uintptr(fds[1]), "usbip-transport"), nil
+}
+
+// runHelper runs sshub-helper as root, with stdin as its stdin if not nil.
+// -n: fail instead of prompting.
+func runHelper(ctx context.Context, stdin *os.File, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "sudo", append([]string{"-n", export.DefaultHelper}, args...)...)
+	if stdin != nil {
+		cmd.Stdin = stdin // an *os.File is passed as fd 0 as is, not copied
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return nil, fmt.Errorf("usbip %s: %w: %s", strings.Join(args, " "), err, msg)
+			return nil, fmt.Errorf("sshub-helper %s: %w: %s", args[0], err, msg)
 		}
-		return nil, fmt.Errorf("usbip %s: %w", strings.Join(args, " "), err)
+		return nil, fmt.Errorf("sshub-helper %s: %w", args[0], err)
 	}
 	return out, nil
 }

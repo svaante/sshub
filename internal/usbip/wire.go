@@ -1,10 +1,10 @@
 // Package usbip implements the USB/IP operation phase (OP_REQ_DEVLIST and
-// OP_REQ_IMPORT; the client side only lists devices), as laid out in the kernel's
+// OP_REQ_IMPORT), both sides, as laid out in the kernel's
 // tools/usb/usbip/src/usbip_network.h.
 //
-// Reads are exact and unbuffered, so after an import request the reader is
-// positioned at the first URB byte and nothing is lost when the connection is
-// handed over to the kernel.
+// Reads are exact and unbuffered, so after an import request or reply the
+// reader is positioned at the first URB byte and nothing is lost when the
+// connection is handed over to the kernel.
 package usbip
 
 import (
@@ -37,6 +37,24 @@ const (
 	StatusNoDev   Status = 4 // device not found
 	StatusError   Status = 5 // unexpected response
 )
+
+func (s Status) String() string {
+	switch s {
+	case StatusOK:
+		return "ok"
+	case StatusNA:
+		return "request failed"
+	case StatusDevBusy:
+		return "device busy"
+	case StatusDevErr:
+		return "device in error state"
+	case StatusNoDev:
+		return "device not found"
+	case StatusError:
+		return "unexpected response"
+	}
+	return fmt.Sprintf("status %d", uint32(s))
+}
 
 // Speed is a USB device speed as encoded on the wire (enum usb_device_speed).
 type Speed uint32
@@ -138,6 +156,45 @@ func ReadImportRequest(r io.Reader) (string, error) {
 	return cString(b[:]), nil
 }
 
+// WriteImportRequest writes an OP_REQ_IMPORT request for busid.
+func WriteImportRequest(w io.Writer, busid string) error {
+	if len(busid) >= busIDSize {
+		return fmt.Errorf("busid %q too long", busid)
+	}
+	var b [busIDSize]byte
+	copy(b[:], busid)
+	h := Header{Version: Version, Code: OpReqImport}
+	if err := binary.Write(w, binary.BigEndian, h); err != nil {
+		return fmt.Errorf("write import request: %w", err)
+	}
+	if _, err := w.Write(b[:]); err != nil {
+		return fmt.Errorf("write import request: %w", err)
+	}
+	return nil
+}
+
+// ReadImportReply reads an OP_REP_IMPORT reply, as written by
+// WriteImportReply.
+func ReadImportReply(r io.Reader) (Device, error) {
+	h, err := ReadHeader(r)
+	if err != nil {
+		return Device{}, err
+	}
+	if h.Code != OpRepImport {
+		return Device{}, fmt.Errorf("read import reply: unexpected op %#04x", h.Code)
+	}
+	if h.Status != StatusOK {
+		return Device{}, fmt.Errorf("import: %v", h.Status)
+	}
+	// An import reply has no interface records, whatever the count
+	// says.
+	d, _, err := readDevice(r)
+	if err != nil {
+		return Device{}, fmt.Errorf("read import reply: %w", err)
+	}
+	return d, nil
+}
+
 // WriteDevlistRequest writes an OP_REQ_DEVLIST request.
 func WriteDevlistRequest(w io.Writer) error {
 	h := Header{Version: Version, Code: OpReqDevlist}
@@ -173,26 +230,11 @@ func ReadDevlistReply(r io.Reader) ([]Device, error) {
 	}
 	devs := make([]Device, 0, n)
 	for range n {
-		var wd wireDevice
-		if err := binary.Read(r, binary.BigEndian, &wd); err != nil {
+		d, nif, err := readDevice(r)
+		if err != nil {
 			return nil, fmt.Errorf("read devlist reply: %w", err)
 		}
-		d := Device{
-			Path:        cString(wd.Path[:]),
-			BusID:       cString(wd.BusID[:]),
-			BusNum:      wd.BusNum,
-			DevNum:      wd.DevNum,
-			Speed:       Speed(wd.Speed),
-			VendorID:    wd.VendorID,
-			ProductID:   wd.ProductID,
-			BCDDevice:   wd.BCDDevice,
-			Class:       wd.Class,
-			SubClass:    wd.SubClass,
-			Protocol:    wd.Protocol,
-			ConfigValue: wd.ConfigValue,
-			NumConfigs:  wd.NumConfigs,
-		}
-		for range wd.NumInterfaces {
+		for range nif {
 			var wi wireInterface
 			if err := binary.Read(r, binary.BigEndian, &wi); err != nil {
 				return nil, fmt.Errorf("read devlist reply: %w", err)
@@ -244,6 +286,31 @@ func WriteImportReply(w io.Writer, st Status, d *Device) error {
 		return fmt.Errorf("write import reply: %w", err)
 	}
 	return nil
+}
+
+// readDevice reads a device record, and returns it with the number of
+// interface records that follow it in a devlist reply.
+func readDevice(r io.Reader) (Device, uint8, error) {
+	var wd wireDevice
+	if err := binary.Read(r, binary.BigEndian, &wd); err != nil {
+		return Device{}, 0, err
+	}
+	d := Device{
+		Path:        cString(wd.Path[:]),
+		BusID:       cString(wd.BusID[:]),
+		BusNum:      wd.BusNum,
+		DevNum:      wd.DevNum,
+		Speed:       Speed(wd.Speed),
+		VendorID:    wd.VendorID,
+		ProductID:   wd.ProductID,
+		BCDDevice:   wd.BCDDevice,
+		Class:       wd.Class,
+		SubClass:    wd.SubClass,
+		Protocol:    wd.Protocol,
+		ConfigValue: wd.ConfigValue,
+		NumConfigs:  wd.NumConfigs,
+	}
+	return d, wd.NumInterfaces, nil
 }
 
 func writeDevice(w io.Writer, d Device) error {
