@@ -16,6 +16,10 @@ sudo scripts/install.sh server
 sudo scripts/install.sh client
 #+end_src
 
+=install.sh server= also makes sshd drop clients that stop answering
+(=/etc/ssh/sshd_config.d/sshub.conf=), so a client that crashes or loses its
+network gets its devices back once it returns.
+
 * Share devices
 
 On the server, list them in =/etc/sshub/devices=, one =vid:pid= per line,

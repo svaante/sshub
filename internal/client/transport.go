@@ -16,15 +16,23 @@ type Transport struct {
 }
 
 // RSH picks the remote-shell command: flag (-e) if set, else env
-// ($SSHUB_RSH), else ssh. It is split on whitespace, with no shell
-// quoting or expansion.
+// ($SSHUB_RSH), else ssh with keepalives. It is split on whitespace, with no
+// shell quoting or expansion.
 func RSH(flag, env string) []string {
 	for _, s := range []string{flag, env} {
 		if f := strings.Fields(s); len(f) > 0 {
 			return f
 		}
 	}
-	return []string{"ssh"}
+	return defaultRSH()
+}
+
+// defaultRSH is ssh, made to exit once the server has not answered for about
+// 15 s. Without that, a server that reboots or drops off the network leaves
+// ssh, and with it the vhci port, waiting until TCP gives up, and vhci
+// enumerates no device while it waits for the answer to a cancelled request.
+func defaultRSH() []string {
+	return []string{"ssh", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"}
 }
 
 // Command returns the command that runs "sshub-server" on the remote,
@@ -32,8 +40,10 @@ func RSH(flag, env string) []string {
 func (t Transport) Command(ctx context.Context) *exec.Cmd {
 	rsh := t.RSH
 	if len(rsh) == 0 {
-		rsh = []string{"ssh"}
+		rsh = defaultRSH()
 	}
 	args := append(rsh[1:len(rsh):len(rsh)], t.Host, "sshub-server")
-	return exec.CommandContext(ctx, rsh[0], args...)
+	cmd := exec.CommandContext(ctx, rsh[0], args...)
+	dieWithParent(cmd)
+	return cmd
 }

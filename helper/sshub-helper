@@ -186,8 +186,9 @@ cmd_release() {
 # usbip tool does, but take the socket from stdin like export: there is no
 # TCP connection for another local user to reach. Each port sshub attaches
 # gets a record, $RUN/port<N>, holding "<uid> <devid>": who attached it, and
-# what. detach and the udev rule (owner) go by it. A record whose port is
-# free, or holds another device, means nothing; attach overwrites it.
+# what. detach and the udev rule (owner) go by it. A record whose port holds
+# another device means nothing; attach overwrites it, and removes the records
+# of free ports.
 
 # caller: the uid of who ran us. sudo sets SUDO_UID itself, whatever the
 # caller's environment says. Run as root without sudo, it is root.
@@ -216,12 +217,13 @@ ports() {
 }
 
 # record_owner PORT DEV: the uid in PORT's record if it is for DEV, the
-# devid in hex as the status files show it. Nothing otherwise.
+# devid in hex as the status files show it. With DEV "any", the uid whatever
+# the devid. Nothing otherwise.
 record_owner() {
 	local uid devid
 	read -r uid devid 2>/dev/null <"$RUN/port$1" || return 0
 	[[ $uid =~ ^[0-9]{1,10}$ && $devid =~ ^[0-9]{1,10}$ ]] || return 0
-	if [[ $(printf '%08x' "$devid") == "$2" ]]; then
+	if [[ $2 == any || $(printf '%08x' "$devid") == "$2" ]]; then
 		printf '%s' "$uid"
 	fi
 }
@@ -244,21 +246,34 @@ cmd_attach() {
 	fi
 	mkdir -p -m 0755 -- "$RUN"
 	trusted "$RUN"
-	# Another attach may take the same free port first: then the kernel
-	# says busy, and the next free one is tried. The ports come in on fd 3:
-	# fd 0 must stay the socket.
+	# One sshub attach at a time: each writes the record of the port it
+	# picks before attaching (see below), so two must not pick the same one.
+	# fd 9: fd 0 must stay the socket.
+	exec 9>"$RUN/lock"
+	flock 9
+	# A free port's record is left over from a device that vhci dropped
+	# without a detach (the connection was lost). Remove it, so it cannot
+	# be taken for a later device on that port.
+	while read -r _ port sta _; do
+		if [[ $sta == 004 ]]; then
+			rm -f -- "$RUN/port$port"
+		fi
+	done < <(ports)
+	# The ports come in on fd 3, also to keep fd 0 the socket.
 	while read -r -u 3 _ port sta _; do
 		[[ $sta == 004 ]] || continue
-		if ! write "$vhci/attach" "$port 0 $devid $speed"; then
-			continue
-		fi
-		# The udev rule needs the record once the device is enumerated,
-		# which takes network round trips after the write above.
+		# The udev rule looks the owner up as soon as the kernel has
+		# enumerated the device, which can be before the attach write
+		# below returns: the record must be in place first.
 		tmp=$RUN/.port$port.$$
 		printf '%s %s\n' "$uid" "$devid" >"$tmp"
 		mv -f -- "$tmp" "$RUN/port$port"
-		printf '%s\n' "$port"
-		return 0
+		if write "$vhci/attach" "$port 0 $devid $speed"; then
+			printf '%s\n' "$port"
+			return 0
+		fi
+		# Taken by an attach outside sshub: try the next free one.
+		rm -f -- "$RUN/port$port"
 	done 3< <(ports | grep "^$hub ")
 	die "attach: no free vhci port took the device"
 }
@@ -272,6 +287,13 @@ cmd_detach() {
 	while read -r hub p sta dev _; do
 		[[ $p == "$port" ]] || continue
 		[[ $sta != 004 ]] || return 0
+		# Until vhci has enumerated the device (005), the status files show
+		# devid 0, so only the record's uid can be checked. The record is
+		# this attach's: attach writes it, under the lock, before the
+		# attach write, and removes the records of free ports.
+		if [[ $sta == 005 ]]; then
+			dev=any
+		fi
 		if [[ $uid != "$ROOT_UID" && $(record_owner "$port" "$dev") != "$uid" ]]; then
 			die "detach: port $port is not yours"
 		fi

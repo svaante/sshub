@@ -21,7 +21,8 @@ const usage = `usage: sshub [-e rsh] <host>
 
 Attaches everything <host> shares, including devices plugged in later;
 Ctrl-C detaches all. -e (or $SSHUB_RSH) sets the transport program,
-default "ssh".`
+default "ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=3". A
+transport of your own should also exit when the server stops answering.`
 
 func main() {
 	flag.Usage = func() { fmt.Fprintln(flag.CommandLine.Output(), usage) }

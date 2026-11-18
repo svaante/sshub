@@ -3,8 +3,8 @@
 # (go build -o . ./cmd/...). Run with sudo:
 #
 #   install.sh [-n] server [user]   sshub-server + helper, usbip-host,
-#                                   /etc/sshub, user (default: who ran sudo)
-#                                   in the sshub group
+#                                   /etc/sshub, sshd keepalives, user
+#                                   (default: who ran sudo) in the sshub group
 #   install.sh [-n] client [user]   sshub + helper, vhci-hcd, udev rule,
 #                                   user in the sshub group
 #   install.sh [-n] uninstall       remove everything except /etc/sshub
@@ -24,6 +24,7 @@ bindir=/usr/local/bin
 libexec=/usr/libexec/sshub
 conf=/etc/sshub
 udev_rule=/etc/udev/rules.d/72-sshub.rules
+sshd_conf=/etc/ssh/sshd_config.d/sshub.conf
 dry= # set by -n
 
 die() {
@@ -110,6 +111,24 @@ install_sudoers() {
 	run install -o root -g root -m 0440 "$1" /etc/sudoers.d/sshub
 }
 
+# install_sshd: keepalives for clients that vanish, checked before sshd
+# reloads. sshd takes the first value it reads for a setting, so one set in
+# sshd_config before its Include wins; say so rather than change it.
+install_sshd() {
+	run install -D -o root -g root -m 0644 "$src/packaging/sshd/sshub.conf" "$sshd_conf"
+	if [ -n "$dry" ]; then
+		return
+	fi
+	if ! sshd -t; then
+		run rm -f "$sshd_conf"
+		die "sshd rejects $sshd_conf; removed it"
+	fi
+	run systemctl reload sshd
+	if ! sshd -T | grep -qx 'clientaliveinterval 5'; then
+		note "sshd ignores $sshd_conf (no Include of sshd_config.d, or ClientAliveInterval set before it)"
+	fi
+}
+
 # load_module NAME: load the kernel module now and at every boot.
 load_module() {
 	put /etc/modules-load.d/sshub.conf "$1"
@@ -145,6 +164,7 @@ server() {
 	run chown root:root "$conf/devices"
 	run chmod 0644 "$conf/devices"
 	install_sudoers "$src/packaging/sudoers/server"
+	install_sshd
 	done_note "server installed; list what to share in $conf/devices"
 }
 
@@ -165,6 +185,10 @@ client() {
 uninstall() {
 	run rm -f /etc/sudoers.d/sshub /etc/modules-load.d/sshub.conf "$udev_rule" \
 		"$bindir/sshub" "$bindir/sshub-server"
+	if [ -e "$sshd_conf" ]; then
+		run rm -f "$sshd_conf"
+		run systemctl reload sshd
+	fi
 	if getent group sshub >/dev/null; then
 		run groupdel sshub
 	fi
